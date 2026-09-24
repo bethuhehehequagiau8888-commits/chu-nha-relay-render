@@ -2,12 +2,11 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 import json
-import os
 import time
 
 DATA = Path(__file__).resolve().parent / "data"
 STATE_FILE = DATA / "relay_state.json"
-PORT = int(os.environ.get("PORT", "8898"))
+PORT = 8898
 
 
 def now_ms():
@@ -55,13 +54,55 @@ def target_matches(device, target):
     return t == "all" or (t == "group" and device.get("group") == value) or (t == "deviceId" and device.get("deviceId") == value)
 
 
+def upsert_device(station, device):
+    devices = station.setdefault("devices", [])
+    device_id = text(device.get("deviceId") or device.get("deviceLocalId"), 120)
+    if not device_id:
+        return None, "missing_device"
+    fixed = dict(device)
+    fixed["deviceId"] = device_id
+    fixed["lastSeen"] = now_ms()
+    for idx, old in enumerate(devices):
+        if old.get("deviceId") == device_id:
+            merged = {**old, **fixed}
+            if isinstance(old.get("appMap"), dict) and isinstance(fixed.get("appMap"), dict):
+                merged["appMap"] = {**old.get("appMap", {}), **fixed.get("appMap", {})}
+            devices[idx] = merged
+            return merged, "updated"
+    devices.append(fixed)
+    return fixed, "added"
+
+
 def jobs_for_device(station, device_id):
-    mission = station.get("mission")
-    if not mission or mission.get("cancelled"):
-        return []
     device = next((d for d in station.get("devices", []) if d.get("deviceId") == device_id), None)
     if not device:
         return []
+    all_jobs = []
+    for mission in active_missions(station):
+        all_jobs.extend(jobs_for_mission_device(mission, device, device_id))
+    return all_jobs
+
+
+def active_missions(station):
+    missions = []
+    seen = set()
+    for mission in station.get("activeMissions", []):
+        if not isinstance(mission, dict) or mission.get("cancelled"):
+            continue
+        mission_id = mission.get("missionId") or id(mission)
+        if mission_id in seen:
+            continue
+        seen.add(mission_id)
+        missions.append(mission)
+    legacy = station.get("mission")
+    if isinstance(legacy, dict) and not legacy.get("cancelled"):
+        mission_id = legacy.get("missionId") or id(legacy)
+        if mission_id not in seen:
+            missions.append(legacy)
+    return missions
+
+
+def jobs_for_mission_device(mission, device, device_id):
     jobs = []
     if isinstance(mission.get("jobs"), list):
         for job in mission.get("jobs", []):
@@ -124,6 +165,22 @@ class Handler(SimpleHTTPRequestHandler):
             jobs = jobs_for_device(station, device_id)
             self.send_json({"ok": True, "jobs": jobs, "missionId": (station.get("mission") or {}).get("missionId")})
             return
+        if parsed.path == "/api/relay/state":
+            qs = parse_qs(parsed.query)
+            station_id = text((qs.get("stationId") or [""])[0], 120)
+            station_key = text((qs.get("stationKey") or [""])[0], 160)
+            station = auth(state, station_id, station_key)
+            if not station:
+                self.send_json({"ok": False, "error": "bad_station"}, 403)
+                return
+            self.send_json({
+                "ok": True,
+                "station": station.get("station"),
+                "devices": station.get("devices", []),
+                "jobStatus": station.get("jobStatus", {}),
+                "updatedAt": station.get("updatedAt", 0)
+            })
+            return
         self.send_json({"ok": False, "error": "not_found"}, 404)
 
     def do_POST(self):
@@ -146,6 +203,7 @@ class Handler(SimpleHTTPRequestHandler):
             station["stationKey"] = station_key
             station.setdefault("devices", [])
             station.setdefault("mission", None)
+            station.setdefault("activeMissions", [])
             station.setdefault("jobStatus", {})
             station["updatedAt"] = now_ms()
             save_state(state)
@@ -161,11 +219,37 @@ class Handler(SimpleHTTPRequestHandler):
 
         if parsed.path == "/api/relay/push_state":
             station["station"] = payload.get("station")
-            station["devices"] = payload.get("devices") if isinstance(payload.get("devices"), list) else station.get("devices", [])
+            if isinstance(payload.get("devices"), list):
+                for device in payload.get("devices", []):
+                    if isinstance(device, dict):
+                        upsert_device(station, device)
             station["mission"] = payload.get("mission")
+            station["activeMissions"] = payload.get("activeMissions") if isinstance(payload.get("activeMissions"), list) else ([payload.get("mission")] if payload.get("mission") else [])
             station["updatedAt"] = now_ms()
             save_state(state)
             self.send_json({"ok": True, "deviceCount": len(station.get("devices", []))})
+            return
+
+        if parsed.path == "/api/relay/report/device":
+            device, result = upsert_device(station, payload)
+            station["updatedAt"] = now_ms()
+            save_state(state)
+            self.send_json({"ok": bool(device), "result": result, "deviceId": device.get("deviceId") if device else ""}, 200 if device else 400)
+            return
+
+        if parsed.path == "/api/relay/report/apps":
+            device_id = text(payload.get("deviceId") or payload.get("deviceLocalId"), 120)
+            device = next((d for d in station.get("devices", []) if d.get("deviceId") == device_id), None)
+            if not device:
+                device, _ = upsert_device(station, {"deviceId": device_id, "label": device_id, "group": "cum_a"})
+            if isinstance(payload.get("apps"), list):
+                device["apps"] = payload.get("apps")
+            if isinstance(payload.get("appMap"), dict):
+                device["appMap"] = {**device.get("appMap", {}), **payload.get("appMap", {})}
+            device["lastSeen"] = now_ms()
+            station["updatedAt"] = now_ms()
+            save_state(state)
+            self.send_json({"ok": True, "deviceId": device_id})
             return
 
         if parsed.path == "/api/relay/job/status":
@@ -187,5 +271,5 @@ class Handler(SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     DATA.mkdir(exist_ok=True)
-    print(f"Chủ Nhà V3 Relay: http://0.0.0.0:{PORT}")
+    print(f"Chủ Nhà V4.0.4 Relay: http://0.0.0.0:{PORT}")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
