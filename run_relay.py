@@ -35,6 +35,10 @@ def text(value, limit=200):
     return str(value or "").replace("<", "").replace(">", "")[:limit]
 
 
+def long_text(value, limit=300000):
+    return str(value or "").replace("<", "").replace(">", "")[:limit]
+
+
 def read_json(handler):
     length = int(handler.headers.get("Content-Length", "0") or "0")
     raw = handler.rfile.read(length).decode("utf-8") if length else "{}"
@@ -178,6 +182,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "station": station.get("station"),
                 "devices": station.get("devices", []),
                 "jobStatus": station.get("jobStatus", {}),
+                "jobReports": station.get("jobReports", []),
                 "updatedAt": station.get("updatedAt", 0)
             })
             return
@@ -205,6 +210,7 @@ class Handler(SimpleHTTPRequestHandler):
             station.setdefault("mission", None)
             station.setdefault("activeMissions", [])
             station.setdefault("jobStatus", {})
+            station.setdefault("jobReports", [])
             station["updatedAt"] = now_ms()
             save_state(state)
             self.send_json({"ok": True})
@@ -258,12 +264,47 @@ class Handler(SimpleHTTPRequestHandler):
             station.setdefault("jobStatus", {})[f"{device_id}:{job_id}"] = {
                 "deviceId": device_id,
                 "jobId": job_id,
+                "missionId": text(payload.get("missionId"), 160),
                 "status": text(payload.get("status"), 80),
+                "stepIndex": int(payload.get("stepIndex") or 0),
                 "message": text(payload.get("message"), 500),
+                "screenReport": payload.get("screenReport") if isinstance(payload.get("screenReport"), dict) else None,
+                "jobReportEncoded": long_text(payload.get("jobReportEncoded"), 300000),
+                "jobReportSchema": text(payload.get("jobReportSchema"), 80),
+                "jobReport": payload.get("jobReport") if isinstance(payload.get("jobReport"), dict) else None,
                 "updatedAt": now_ms()
             }
             save_state(state)
             self.send_json({"ok": True})
+            return
+
+        if parsed.path == "/api/relay/job/report":
+            report = dict(payload)
+            report["reportId"] = text(report.get("reportId") or f"job_report_{now_ms()}", 160)
+            report["deviceId"] = text(report.get("deviceId"), 120)
+            report["jobId"] = text(report.get("jobId"), 160)
+            report["missionId"] = text(report.get("missionId"), 160)
+            report["source"] = "relay_agent_button"
+            report["updatedAt"] = now_ms()
+            station.setdefault("jobReports", []).insert(0, report)
+            station["jobReports"] = station["jobReports"][:80]
+            if report.get("jobId"):
+                station.setdefault("jobStatus", {})[f"{report.get('deviceId')}:{report.get('jobId')}"] = {
+                    "deviceId": report.get("deviceId"),
+                    "jobId": report.get("jobId"),
+                    "missionId": report.get("missionId"),
+                    "status": text(report.get("status") or "manual_report", 80),
+                    "stepIndex": int(report.get("lastStepIndex") or 0),
+                    "message": text(report.get("message") or "manual job report", 500),
+                    "screenReport": report.get("currentScreen") if isinstance(report.get("currentScreen"), dict) else report.get("finalScreen") if isinstance(report.get("finalScreen"), dict) else None,
+                    "jobReportEncoded": long_text(report.get("jobReportEncoded"), 300000),
+                    "jobReportSchema": text(report.get("schemaVersion") or report.get("jobReportSchema"), 80),
+                    "jobReport": report,
+                    "updatedAt": now_ms()
+                }
+            station["updatedAt"] = now_ms()
+            save_state(state)
+            self.send_json({"ok": True, "result": "job_report_saved", "reportId": report.get("reportId")})
             return
 
         self.send_json({"ok": False, "error": "not_found"}, 404)
@@ -271,5 +312,5 @@ class Handler(SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     DATA.mkdir(exist_ok=True)
-    print(f"Chủ Nhà V4.0.4 Relay: http://0.0.0.0:{PORT}")
+    print(f"Chủ Nhà V4.2.1 Relay: http://0.0.0.0:{PORT}")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
