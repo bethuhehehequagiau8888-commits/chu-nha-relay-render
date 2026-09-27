@@ -312,5 +312,5 @@ class Handler(SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     DATA.mkdir(exist_ok=True)
-    print(f"Chủ Nhà V4.2.1 Relay: http://0.0.0.0:{PORT}")
+    print(f"Chủ Nhà V4.2.2 Relay: http://0.0.0.0:{PORT}")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
