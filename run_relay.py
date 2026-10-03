@@ -3,11 +3,90 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 import json
 import time
+import os
+import threading
+from functools import wraps
+
+STATE_LOCK = threading.RLock()
+def state_serialized(fn):
+    @wraps(fn)
+    def wrapped(*a, **kw):
+        with STATE_LOCK: return fn(*a, **kw)
+    return wrapped
 
 DATA = Path(__file__).resolve().parent / "data"
 STATE_FILE = DATA / "relay_state.json"
-PORT = 8898
+PORT = int(os.environ.get("PORT", "8898"))
 
+
+
+# Session protocol 1. A tiny epoch/ack survives cleanup to reject delayed old data.
+TERMINAL = {"done", "error", "stopped_by_user", "interrupted"}
+MAX_PAYLOAD = 16 * 1024 * 1024
+
+def epoch(s):
+    return s.get("sessionEpoch", "legacy")
+
+def active_job_ids(s):
+    ids = set()
+    for m in active_missions(s):
+        if isinstance(m.get("jobs"), list):
+            ids.update(str(j.get("jobId", "")) for j in m["jobs"])
+        else:
+            ids.add(str(m.get("jobId", "")))
+    return ids
+
+def session_info(s):
+    return {"ok": True, "protocol": 1, "sessionEpoch": epoch(s),
+            "cleanupAcks": s.get("cleanupAcks", {}),
+            "pendingDevices": [d.get("deviceId") for d in s.get("devices", [])
+                if s.get("cleanupAcks", {}).get(d.get("deviceId")) != epoch(s)]}
+
+def purge_session(s, new_epoch):
+    s.update(sessionEpoch=new_epoch, mission=None, activeMissions=[], missionHistory=[],
+             jobStatus={}, jobReports=[], logs=[], terminalJobs={}, hiddenJobHistory={},
+             hiddenMissionIds=[], cleanupAcks={})
+    for d in s.get("devices", []):
+        for k in ("currentJobId", "lastError", "screenReport", "jobReport", "jobReportEncoded", "apps", "deviceProfile", "stationKey"):
+            d.pop(k, None)
+        d["status"] = "cleanup_pending"
+
+def accept_session(s, p):
+    return epoch(s) == "legacy" or p.get("sessionEpoch") == epoch(s)
+
+def record_terminal(s, p):
+    if p.get("status") in TERMINAL:
+        s.setdefault("terminalJobs", {})[str(p.get("deviceId"))+":"+str(p.get("jobId"))] = True
+
+def pending_jobs(s, device_id, jobs):
+    done = s.get("terminalJobs", {})
+    statuses = s.get("jobStatus", {})
+    return [dict(j, sessionEpoch=epoch(s)) for j in jobs
+            if not done.get(device_id+":"+str(j.get("jobId")))
+            and statuses.get(device_id+":"+str(j.get("jobId")), {}).get("status") not in TERMINAL]
+
+def bound_session(s):
+    # Receipts are retained while jobs remain deliverable; eviction cannot replay them.
+    ids = active_job_ids(s)
+    s["terminalJobs"] = {k:v for k,v in s.get("terminalJobs", {}).items() if k.rsplit(":",1)[-1] in ids}
+    statuses = sorted(s.get("jobStatus", {}).items(), key=lambda kv: kv[1].get("updatedAt",0), reverse=True)
+    s["jobStatus"] = dict(statuses[:200])
+    reports = s.get("jobReports", [])[:20]
+    total = 0; kept = []
+    for r in reports:
+        size = len(json.dumps(r, ensure_ascii=False).encode("utf-8"))
+        if total + size > 24 * 1024 * 1024: break
+        kept.append(r); total += size
+    s["jobReports"] = kept
+    for hidden in s.get("hiddenJobHistory", {}).values():
+        hidden["reports"] = hidden.get("reports", [])[-1000:]
+        hidden["statuses"] = hidden.get("statuses", [])[-1000:]
+    s["hiddenMissionIds"] = s.get("hiddenMissionIds", [])[-1000:]
+    # Heavy report bodies live in jobReports only, never twice in jobStatus.
+    for item in s["jobStatus"].values():
+        item.pop("jobReportEncoded", None)
+        item.pop("jobReport", None)
+        item.pop("screenReport", None)
 
 def now_ms():
     return int(time.time() * 1000)
@@ -27,8 +106,11 @@ def load_state():
 
 
 def save_state(state):
+    [bound_session(st) for st in state.get("stations", {}).values()]
     DATA.mkdir(exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp = STATE_FILE.with_suffix(".tmp")
+    temp.write_text(json.dumps(state, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    temp.replace(STATE_FILE)
 
 
 def text(value, limit=200):
@@ -41,6 +123,7 @@ def long_text(value, limit=300000):
 
 def read_json(handler):
     length = int(handler.headers.get("Content-Length", "0") or "0")
+    if length < 0 or length > MAX_PAYLOAD: raise ValueError("payload_too_large")
     raw = handler.rfile.read(length).decode("utf-8") if length else "{}"
     return json.loads(raw)
 
@@ -63,7 +146,7 @@ def upsert_device(station, device):
     device_id = text(device.get("deviceId") or device.get("deviceLocalId"), 120)
     if not device_id:
         return None, "missing_device"
-    fixed = dict(device)
+    fixed = {k:v for k,v in device.items() if k not in ("stationKey", "stationId")}
     fixed["deviceId"] = device_id
     fixed["lastSeen"] = now_ms()
     for idx, old in enumerate(devices):
@@ -84,7 +167,7 @@ def jobs_for_device(station, device_id):
     all_jobs = []
     for mission in active_missions(station):
         all_jobs.extend(jobs_for_mission_device(mission, device, device_id))
-    return all_jobs
+    return pending_jobs(station, device_id, all_jobs)
 
 
 def active_missions(station):
@@ -133,6 +216,10 @@ def jobs_for_mission_device(mission, device, device_id):
 
 
 class Handler(SimpleHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        # Query strings contain station credentials. Never write them to server logs.
+        return
+
     def end_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -151,13 +238,14 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    @state_serialized
     def do_GET(self):
         parsed = urlparse(self.path)
         state = load_state()
         if parsed.path == "/api/relay/health":
-            self.send_json({"ok": True, "stationCount": len(state["stations"])})
+            self.send_json({"ok": True, "stationCount": len(state["stations"]), "protocol": 1, "version": "4.3.9"})
             return
-        if parsed.path == "/api/relay/mission":
+        if parsed.path in ("/api/relay/mission", "/api/relay/session"):
             qs = parse_qs(parsed.query)
             station_id = text((qs.get("stationId") or [""])[0], 120)
             station_key = text((qs.get("stationKey") or [""])[0], 160)
@@ -166,8 +254,10 @@ class Handler(SimpleHTTPRequestHandler):
             if not station:
                 self.send_json({"ok": False, "error": "bad_station"}, 403)
                 return
+            if parsed.path.endswith("/session"):
+                self.send_json(session_info(station)); return
             jobs = jobs_for_device(station, device_id)
-            self.send_json({"ok": True, "jobs": jobs, "missionId": (station.get("mission") or {}).get("missionId")})
+            self.send_json({"ok": True, "jobs": jobs, "sessionEpoch": epoch(station), "protocol": 1, "missionId": (station.get("mission") or {}).get("missionId")})
             return
         if parsed.path == "/api/relay/state":
             qs = parse_qs(parsed.query)
@@ -179,6 +269,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             self.send_json({
                 "ok": True,
+                "sessionEpoch": epoch(station),
+                "protocol": 1,
                 "station": station.get("station"),
                 "devices": station.get("devices", []),
                 "jobStatus": station.get("jobStatus", {}),
@@ -188,6 +280,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
         self.send_json({"ok": False, "error": "not_found"}, 404)
 
+    @state_serialized
     def do_POST(self):
         parsed = urlparse(self.path)
         state = load_state()
@@ -204,6 +297,8 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_json({"ok": False, "error": "missing_station"}, 400)
                 return
             station = state["stations"].setdefault(station_id, {})
+            if station.get("stationKey") and station["stationKey"] != station_key:
+                self.send_json({"ok": False, "error": "bad_station"}, 403); return
             station["stationId"] = station_id
             station["stationKey"] = station_key
             station.setdefault("devices", [])
@@ -223,6 +318,27 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_json({"ok": False, "error": "bad_station"}, 403)
             return
 
+        if parsed.path == "/api/relay/session/cleanup":
+            new = text(payload.get("newEpoch"), 120)
+            if not new or new == "legacy":
+                self.send_json({"ok": False, "error": "invalid_epoch"}, 400); return
+            if epoch(station) != new:
+                if payload.get("expectedEpoch") != epoch(station):
+                    self.send_json({"ok": False, "error": "session_conflict"}, 409); return
+                for d in payload.get("devices", []):
+                    if isinstance(d,dict): upsert_device(station,{k:d[k] for k in ("deviceId","label","group","appMap") if k in d})
+                purge_session(station, new)
+                save_state(state)
+            self.send_json(session_info(station)); return
+        if parsed.path == "/api/relay/session/ack":
+            if not accept_session(station, payload):
+                self.send_json({"ok": False, "error": "stale_session"}, 409); return
+            did = text(payload.get("deviceId"), 120)
+            if any(d.get("deviceId") == did for d in station.get("devices", [])):
+                station.setdefault("cleanupAcks", {})[did] = epoch(station)
+            save_state(state); self.send_json({"ok": True}); return
+        if parsed.path in ("/api/relay/push_state", "/api/relay/job/status", "/api/relay/job/report", "/api/relay/report/device", "/api/relay/report/apps") and not accept_session(station, payload):
+            self.send_json({"ok": False, "error": "stale_session"}, 409); return
         if parsed.path == "/api/relay/push_state":
             station["station"] = payload.get("station")
             if isinstance(payload.get("devices"), list):
@@ -259,6 +375,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         if parsed.path == "/api/relay/job/status":
+            record_terminal(station, payload)
             device_id = text(payload.get("deviceId"), 120)
             job_id = text(payload.get("jobId"), 160)
             station.setdefault("jobStatus", {})[f"{device_id}:{job_id}"] = {
@@ -279,6 +396,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         if parsed.path == "/api/relay/job/report":
+            record_terminal(station, payload)
             report = dict(payload)
             report["reportId"] = text(report.get("reportId") or f"job_report_{now_ms()}", 160)
             report["deviceId"] = text(report.get("deviceId"), 120)
@@ -312,5 +430,5 @@ class Handler(SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     DATA.mkdir(exist_ok=True)
-    print(f"Chủ Nhà V4.3.0 Relay: http://0.0.0.0:{PORT}")
+    print(f"Chủ Nhà V4.3.9 Relay: http://0.0.0.0:{PORT}")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
